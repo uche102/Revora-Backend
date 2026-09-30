@@ -128,9 +128,10 @@ interface AuthenticatedRequest extends Request {
   user?: AuthenticatedUser;
 }
 
-interface AppDependencies {
+export interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
+  startupTierLimiter?: ReturnType<typeof createStartupAuthTierLimiter>;
 }
 
 /**
@@ -697,7 +698,8 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
    * - Rate-limit state is in-process; a distributed store (e.g. Redis) must be
    *   substituted for multi-instance deployments.
    */
-  const startupTierLimiter = createStartupAuthTierLimiter();
+  const startupTierLimiter =
+    dependencies.startupTierLimiter ?? createStartupAuthTierLimiter();
   apiRouter.post(
     "/startup/register",
     startupTierLimiter.middleware,
@@ -850,7 +852,11 @@ export const __test = {
   OfacSanctionsLoader,
 };
 
-export { classifyStellarRPCFailure, StellarRPCFailureClass };
+export {
+  classifyStellarRPCFailure,
+  StellarRPCFailureClass,
+  createStartupAuthTierLimiter,
+};
 
 export const app = createApp();
 

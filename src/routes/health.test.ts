@@ -1028,7 +1028,18 @@ describe("healthStartupHandler - startup probe", () => {
 });
 
 describe("createHealthRouter - k8s probe endpoints", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
   it("mounts all health endpoints correctly", async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
     const mockDbHealth = jest.fn().mockResolvedValue({
       healthy: true,
       latencyMs: 10,
@@ -1666,7 +1677,136 @@ describe("Rate Limiter Tier Policies (BE-011)", () => {
     expect(typeof blocked.body.message).toBe("string");
     expect(blocked.body.message.length).toBeGreaterThan(0);
   });
-});
 
-/ /   R a t e   l i m i t e r   t e s t s  
- 
+  // ── Internal tier quota exhaustion ──────────────────────────────────────────
+
+  it("allows exactly internal-limit requests and blocks the 26th request (26th → 429)", async () => {
+    const app = makeApp();
+    const body = { email: "internal-load@example.com", password: "p" };
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.internal.limit; i++) {
+      const r = await request(app)
+        .post(`${API}/startup/register`)
+        .set(STARTUP_AUTH_RATE_TIER_HEADER, "internal")
+        .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+        .send(body);
+      expect(r.status).toBe(201);
+    }
+
+    const blocked = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "internal")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send(body);
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["x-ratelimit-tier"]).toBe("internal");
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.internal.limit),
+    );
+  });
+
+  // ── Pre-validation rate limiting & abuse boundaries ──────────────────────────
+
+  it("enforces rate limits even when registration payload is invalid (400 -> 429)", async () => {
+    const app = makeApp();
+    const invalidBody = {}; // Missing email and password
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      const r = await request(app).post(`${API}/startup/register`).send(invalidBody);
+      expect(r.status).toBe(400);
+      expect(r.headers["x-ratelimit-tier"]).toBe("standard");
+    }
+
+    // 6th invalid request is blocked by rate limiter before validation runs
+    const blocked = await request(app).post(`${API}/startup/register`).send(invalidBody);
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["x-ratelimit-tier"]).toBe("standard");
+  });
+
+  // ── Header case-insensitivity & whitespace trimming ─────────────────────────
+
+  it("handles uppercase and whitespace in tier header correctly", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "  TRUSTED  ")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, `  ${tierSecret}  `)
+      .send({ email: "trimmed@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("trusted");
+    expect(res.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.trusted.limit),
+    );
+  });
+
+  it("downgrades to standard tier when tier secret is whitespace only", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, "   ")
+      .send({ email: "spaces@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+  });
+
+  it("downgrades to standard tier when STARTUP_AUTH_TIER_SECRET is not configured on server", async () => {
+    delete process.env.STARTUP_AUTH_TIER_SECRET;
+    const app = createApp({
+      healthQuery: jest.fn().mockResolvedValue({ rows: [{ now: new Date() }] }),
+      healthStatus: jest.fn().mockResolvedValue({
+        healthy: true,
+        latencyMs: 2,
+        pool: { totalCount: 1, idleCount: 1, waitingCount: 0, maxConnections: 10 },
+      }),
+    });
+
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send({ email: "noenv@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+  });
+
+  // ── Dependency injection & reset capability ──────────────────────────────────
+
+  it("supports dependency injection of custom startupTierLimiter and resets correctly", async () => {
+    process.env.STARTUP_AUTH_TIER_SECRET = tierSecret;
+    const customLimiter = __test.createStartupAuthTierLimiter();
+    const app = createApp({
+      startupTierLimiter: customLimiter,
+      healthQuery: jest.fn().mockResolvedValue({ rows: [{ now: new Date() }] }),
+      healthStatus: jest.fn().mockResolvedValue({
+        healthy: true,
+        latencyMs: 2,
+        pool: { totalCount: 1, idleCount: 1, waitingCount: 0, maxConnections: 10 },
+      }),
+    });
+
+    // Exhaust quota
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      const res = await request(app)
+        .post(`${API}/startup/register`)
+        .send({ email: "di@example.com", password: "p" });
+      expect(res.status).toBe(201);
+    }
+
+    const blocked = await request(app)
+      .post(`${API}/startup/register`)
+      .send({ email: "di@example.com", password: "p" });
+    expect(blocked.status).toBe(429);
+
+    // Reset via limiter instance
+    customLimiter.reset();
+
+    const allowedAfterReset = await request(app)
+      .post(`${API}/startup/register`)
+      .send({ email: "di@example.com", password: "p" });
+    expect(allowedAfterReset.status).toBe(201);
+  });
+});
